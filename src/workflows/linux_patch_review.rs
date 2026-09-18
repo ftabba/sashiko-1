@@ -368,7 +368,16 @@ pub(crate) fn validate_verification_output(
     output: &VerificationOutput,
     _state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
-    non_object_element("findings", &output.findings)
+    non_object_element("findings", &output.findings)?;
+    match output.findings.iter().position(|f| {
+        f.get("introduced_in_patch")
+            .is_some_and(|v| !(v.is_null() || v.is_i64()))
+    }) {
+        Some(i) => Err(format!(
+            "'findings[{i}].introduced_in_patch' must be an integer patch number or null"
+        )),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn format_conflict_resolution_feedback(violation: &str) -> String {
@@ -1054,7 +1063,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "introduced_in_patch" (an integer or null: the series position, as in "[Patch N of M]", of the patch whose change first made the problem present, chosen from the series block (the patch under review on its header line, the preceding and subsequent lists below it): an earlier patch when the problem was already present in the tree this patch was applied to, the one whose change made it so, not merely the last to touch the code; the patch under review when its own diff introduces the problem; a subsequent patch when only that patch's change makes it a problem; null when "preexisting" is true, that is, the code came from before the series, or you cannot tell), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
@@ -1065,6 +1074,7 @@ Example Output:
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
       "preexisting": false,
+      "introduced_in_patch": 1,
       "locations": [
         {{
           "file": "path/to/file.c",
@@ -1338,6 +1348,22 @@ mod tests {
             validate_conflict_resolution_output(&bad, &state).unwrap_err(),
             "'concerns[0]' is not a JSON object"
         );
+
+        let bad = VerificationOutput {
+            findings: vec![json!({"problem": "p", "introduced_in_patch": "abc123"})],
+        };
+        assert_eq!(
+            validate_verification_output(&bad, &state).unwrap_err(),
+            "'findings[0].introduced_in_patch' must be an integer patch number or null"
+        );
+        let ok = VerificationOutput {
+            findings: vec![
+                json!({"problem": "p", "introduced_in_patch": 3}),
+                json!({"problem": "q", "introduced_in_patch": null}),
+                json!({"problem": "r"}),
+            ],
+        };
+        assert!(validate_verification_output(&ok, &state).is_ok());
     }
 
     #[test]
