@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
@@ -1023,10 +1023,21 @@ async fn run_worker_in_worktree(
                     combined_summary.push_str(summary.trim());
                 }
             }
-            // The pass is stamped on findings and concerns alike.
+            // The pass is stamped on findings and concerns alike. The stage
+            // validators reject a non-object element before it gets here; a
+            // result that arrived without them (the daemon's stdio path, an
+            // older worker) is warned about and the element dropped, since
+            // indexing it would panic.
             let stamp = |key: &str, dest: &mut Vec<Value>| {
                 if let Some(items) = review.get(key).and_then(|v| v.as_array()) {
                     for item in items {
+                        if !item.is_object() {
+                            warn!(
+                                "patch {}: dropping a non-object element of {}: {}",
+                                p_idx, key, item
+                            );
+                            continue;
+                        }
                         let mut val = item.clone();
                         val["patch_index"] = json!(p_idx);
                         val["patch_subject"] = json!(patch_subject);
