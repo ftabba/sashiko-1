@@ -548,40 +548,60 @@ fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> s
     }
 }
 
-/// Creates an AI provider, wrapping it with a response cache when
-/// `ai.response_cache` is set.
+/// Creates an AI provider, wrapped with the response cache where it is used.
 ///
 /// `database` is the caller's database, which decides where the cache lives.
 /// A local review passes None: it holds `AiSettings` alone, with no database
-/// for the cache to sit beside.
+/// for the cache to sit beside. A local review also records every answer
+/// whatever the settings say, so that an interrupted one can be resumed, and
+/// replays them only with `response_cache` or `--resume`.
 pub async fn create_provider_cached(
     ai: &AiSettings,
-    #[cfg_attr(not(feature = "cache"), allow(unused_variables))] database: Option<&str>,
+    database: Option<&str>,
 ) -> Result<Arc<dyn AiProvider>> {
     let provider = create_provider_from_ai(ai)?;
+    let replay = ai.response_cache || ai.resume;
     // A daemon-spawned worker reaches the model through a stdio provider, and
     // the daemon holds a cache on the far side of it. Caching here as well
     // would give one run two of them, filled from the same responses.
-    if !ai.response_cache || ai.provider.starts_with("stdio-") {
+    if (!replay && database.is_some()) || ai.provider.starts_with("stdio-") {
         return Ok(provider);
     }
     #[cfg(feature = "cache")]
     {
         let cache_path = response_cache_path(database, &crate::utils::data_home()?);
-        if let Some(parent) = cache_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let opened = async {
+            if let Some(parent) = cache_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            cache::CachingAiProvider::new(
+                provider.clone(),
+                &cache_path.to_string_lossy(),
+                ai.response_cache_ttl_days,
+            )
+            .await
         }
-        let cached = cache::CachingAiProvider::new(
-            provider,
-            &cache_path.to_string_lossy(),
-            ai.response_cache_ttl_days,
-        )
-        .await?;
-        Ok(Arc::new(cached))
+        .await;
+        match opened {
+            Ok(cached) if replay => Ok(Arc::new(cached)),
+            Ok(cached) => Ok(Arc::new(cached.record_only())),
+            // Recording is only for a later --resume, so it never fails a review.
+            Err(e) if !replay => {
+                tracing::warn!(
+                    "Not recording responses, {} is unavailable: {e:#}",
+                    cache_path.display()
+                );
+                Ok(provider)
+            }
+            Err(e) => Err(e),
+        }
     }
     #[cfg(not(feature = "cache"))]
     {
-        bail!("ai.response_cache requires the 'cache' feature")
+        if !replay {
+            return Ok(provider);
+        }
+        bail!("ai.response_cache and --resume require the 'cache' feature")
     }
 }
 
@@ -1563,6 +1583,27 @@ mod tests {
         let provider = create_provider_cached(&settings.ai, Some(&nested_db_str)).await?;
         assert_eq!(provider.get_capabilities().model_name, "gemini-1.5-flash");
         assert!(nested_db.parent().unwrap().exists());
+        Ok(())
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn test_resume_replays_through_the_cache_where_the_settings_do_not() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("sashiko.db");
+        let db = db.to_string_lossy();
+
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-1.5-flash".to_string();
+        settings.ai.response_cache = false;
+
+        let provider = create_provider_cached(&settings.ai, Some(&db)).await?;
+        assert!(provider.cache_stats().is_none());
+
+        settings.ai.resume = true;
+        let provider = create_provider_cached(&settings.ai, Some(&db)).await?;
+        assert!(provider.cache_stats().is_some());
         Ok(())
     }
 

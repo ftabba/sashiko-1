@@ -49,7 +49,12 @@ sashiko review
 # Review a range of commits (pass --report-preexisting to also report pre-existing bugs)
 sashiko review HEAD~3..HEAD
 sashiko review --report-preexisting
+
+# Continue a review cut short by a quota stop, a timeout or Ctrl-C
+sashiko review HEAD~3..HEAD --resume
 ```
+
+A local review records each request and the model's response under `$XDG_DATA_HOME/sashiko/`. `--resume` replays them, so the run sends the model only the requests the interrupted one never had answered. Without it, and without `[ai] response_cache`, every run sends every request to the model.
 
 Local review reads each commit in the range from git, without a scratch clone or patch application, and leaves your working tree untouched.
 

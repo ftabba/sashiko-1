@@ -660,6 +660,9 @@ pub struct AiSettings {
     pub log_turns: bool,
     #[serde(default)]
     pub response_cache: bool,
+    /// Replay the answers a local review recorded, as `response_cache` does.
+    #[serde(skip, default)]
+    pub resume: bool,
     #[serde(default = "default_response_cache_ttl_days")]
     pub response_cache_ttl_days: u64,
     // Provider-specific settings
@@ -1178,13 +1181,15 @@ pub struct Settings {
 
 /// What a command line can say that a settings file says too.
 ///
-/// A flag not given is None, or false for the two that can only turn something
-/// off. Every command fills in the ones it has and leaves the rest alone.
+/// A flag not given is None, or false for the three that can only switch
+/// something one way. Every command fills in the ones it has and leaves the
+/// rest alone.
 #[derive(Debug, Default)]
 pub struct Overrides {
     pub repository_path: Option<String>,
     pub worktree_dir: Option<String>,
     pub no_ai: bool,
+    pub resume: bool,
     pub ai_provider: Option<String>,
     pub ai_model: Option<String>,
     pub effort: Option<EffortMode>,
@@ -1213,6 +1218,7 @@ impl Settings {
             changed.push("AI interactions disabled via --no-ai flag".to_string());
             self.ai.no_ai = true;
         }
+        self.ai.resume |= overrides.resume;
         if let Some(provider) = overrides.ai_provider {
             self.ai.provider = provider;
         }
@@ -1684,12 +1690,14 @@ mod tests {
         assert_eq!(settings.git.repository_path, "from_file");
         assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_file"));
         assert!(!settings.ai.no_ai);
+        assert!(!settings.ai.resume);
         assert!(settings.review.stages.is_none());
 
         let changed = settings.apply_overrides(Overrides {
             repository_path: Some("from_flag".to_string()),
             worktree_dir: Some("from_flag".to_string()),
             no_ai: true,
+            resume: true,
             ai_provider: Some("stdio-claude".to_string()),
             ai_model: Some("from_flag".to_string()),
             effort: Some(EffortMode::Dynamic),
@@ -1698,7 +1706,7 @@ mod tests {
             port: Some(9090),
         });
         // The daemon logs these at startup, so their wording and order are
-        // user-visible. The other three overrides were never reported.
+        // user-visible. The other overrides were never reported.
         assert_eq!(
             changed,
             [
@@ -1711,6 +1719,7 @@ mod tests {
         assert_eq!(settings.git.repository_path, "from_flag");
         assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_flag"));
         assert!(settings.ai.no_ai);
+        assert!(settings.ai.resume);
         assert_eq!(settings.ai.provider, "stdio-claude");
         assert_eq!(settings.ai.model, "from_flag");
         assert_eq!(settings.review.effort, Some(EffortMode::Dynamic));

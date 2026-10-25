@@ -22,6 +22,7 @@ pub struct CachingAiProvider {
     hits_prev: AtomicU64,
     tokens_saved_this: AtomicU64,
     tokens_saved_prev: AtomicU64,
+    replay: bool,
 }
 
 impl CachingAiProvider {
@@ -88,7 +89,15 @@ impl CachingAiProvider {
             hits_prev: AtomicU64::new(0),
             tokens_saved_this: AtomicU64::new(0),
             tokens_saved_prev: AtomicU64::new(0),
+            replay: true,
         })
+    }
+
+    /// Records every answer and serves none, so a run that asks the model
+    /// afresh still leaves its answers for a later run to replay.
+    pub fn record_only(mut self) -> Self {
+        self.replay = false;
+        self
     }
 
     fn compute_cache_key(&self, request: &AiRequest) -> String {
@@ -124,49 +133,51 @@ impl AiProvider for CachingAiProvider {
         let hash = self.compute_cache_key(&request);
         let hash_prefix = &hash[..12];
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
-                libsql::params![hash.clone()],
-            )
-            .await?;
+        if self.replay {
+            let mut rows = self
+                .conn
+                .query(
+                    "SELECT response_json, tokens_saved, created_at FROM response_cache WHERE request_hash = ?",
+                    libsql::params![hash.clone()],
+                )
+                .await?;
 
-        if let Some(row) = rows.next().await? {
-            let response_json: String = row.get(0)?;
-            let tokens_saved: i64 = row.get(1)?;
-            let created_at: i64 = row.get(2)?;
-            if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let (origin, total) = if created_at >= self.session_start {
-                    self.hits_this.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_this
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("this session", t)
-                } else {
-                    self.hits_prev.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_prev
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("previous session", t)
-                };
-                info!(
-                    "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
-                    hash_prefix, origin, tokens_saved, origin, total
-                );
-                if let Some(ref mut usage) = resp.usage {
-                    // The hit serves the whole prompt from this cache, so all
-                    // of it counts as cached.  cached_tokens is a breakdown
-                    // of prompt_tokens rather than an addend.  The count
-                    // recorded with the response covers this same prompt.
-                    usage.cached_tokens = Some(usage.prompt_tokens);
+            if let Some(row) = rows.next().await? {
+                let response_json: String = row.get(0)?;
+                let tokens_saved: i64 = row.get(1)?;
+                let created_at: i64 = row.get(2)?;
+                if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
+                    let (origin, total) = if created_at >= self.session_start {
+                        self.hits_this.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_this
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("this session", t)
+                    } else {
+                        self.hits_prev.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_prev
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("previous session", t)
+                    };
+                    info!(
+                        "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
+                        hash_prefix, origin, tokens_saved, origin, total
+                    );
+                    if let Some(ref mut usage) = resp.usage {
+                        // The hit serves the whole prompt from this cache, so all
+                        // of it counts as cached.  cached_tokens is a breakdown
+                        // of prompt_tokens rather than an addend.  The count
+                        // recorded with the response covers this same prompt.
+                        usage.cached_tokens = Some(usage.prompt_tokens);
+                    }
+                    return Ok(resp);
                 }
-                return Ok(resp);
             }
+            drop(rows);
         }
-        drop(rows);
 
         debug!("Cache miss [{}]", hash_prefix);
 
@@ -612,6 +623,79 @@ mod tests {
             per_attempt[1] > 0,
             "the retry never reached the model: calls per attempt {:?}",
             per_attempt
+        );
+    }
+
+    /// Answers every request with JSON the session accepts, and counts how
+    /// often it was actually asked.
+    struct AcceptedAnswers {
+        calls: Arc<AtomicU64>,
+    }
+
+    #[async_trait]
+    impl AiProvider for AcceptedAnswers {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some("{}".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_recording_run_asks_afresh_and_leaves_its_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let calls = Arc::new(AtomicU64::new(0));
+        let provider = |record_only: bool| {
+            let calls = calls.clone();
+            let path = path.clone();
+            async move {
+                let cached = CachingAiProvider::new(
+                    Arc::new(AcceptedAnswers { calls }),
+                    path.to_str().unwrap(),
+                    30,
+                )
+                .await
+                .unwrap();
+                if record_only {
+                    cached.record_only()
+                } else {
+                    cached
+                }
+            }
+        };
+
+        // The second recording run asks again for the answer the first one
+        // recorded.
+        for _run in 1..=2 {
+            SessionRunner::new(&provider(true).await)
+                .run(&mut JsonSession)
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        SessionRunner::new(&provider(false).await)
+            .run(&mut JsonSession)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a replaying run is served the recorded answer"
         );
     }
 

@@ -1823,4 +1823,149 @@ mod tests {
                 .contains("wasn't introduced by this patch")
         );
     }
+
+    /// Answers the goal, verification and report stages of a review that
+    /// finds one bug, and counts how often it was asked. When told to, it
+    /// fails the verification requests, as a quota running out there does.
+    #[cfg(feature = "cache")]
+    struct MockInterruptibleProvider {
+        calls: std::sync::Arc<AtomicUsize>,
+        stop_at_verification: bool,
+    }
+
+    #[cfg(feature = "cache")]
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for MockInterruptibleProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let last_user = request
+                .messages
+                .iter()
+                .rfind(|m| m.role == crate::ai::AiRole::User)
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default();
+            let verification = last_user.contains("# Verification and severity estimation")
+                || last_user.contains("# Consolidate, classify, and verify concerns");
+            if self.stop_at_verification && verification {
+                anyhow::bail!("mock: quota exhausted");
+            }
+            self.calls.fetch_add(1, Ordering::SeqCst);
+
+            let content = if last_user.contains("# Analyze commit main goal") {
+                r#"{"concerns": [{"type": "Bug", "description": "foo() leaks buf", "reasoning": "Missing kfree", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
+            } else if verification {
+                r#"{"findings": [{"source_ids": ["C1"], "problem": "foo() leaks buf", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
+            } else if last_user.contains("# LKML-friendly report generation") {
+                "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\n> +int x;\n\n[Severity: High]\nfoo() leaks buf.\n"
+            } else {
+                r#"{"concerns": [], "dismissed_concerns": []}"#
+            };
+            Ok(crate::ai::AiResponse {
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn test_an_interrupted_review_resumes_from_its_recorded_answers() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+        let cache_path = temp_dir.path().join("response_cache.db");
+        let cache_path = cache_path.to_str().unwrap();
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"index": 1, "diff": "diff --git a/foo.c b/foo.c\n+int x;", "commit_id": "sha1"}]
+        });
+
+        let review = |provider: std::sync::Arc<dyn crate::ai::AiProvider>| {
+            let mut worker = Worker::new(
+                provider,
+                std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                    temp_dir.path().to_path_buf(),
+                    None,
+                )),
+                PromptRegistry::new(prompts_dir.clone()),
+                WorkerConfig {
+                    project: ProjectId::Linux,
+                    max_input_tokens: 10000,
+                    max_interactions: 3,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: Some("base_sha".to_string()),
+                    custom_prompt: None,
+                    stages: Some(vec!["goal".to_string()]),
+                    skip_report: false,
+                    report_preexisting: false,
+                    effort: None,
+                    use_code_notes: false,
+                    code_notes_scope: Default::default(),
+                },
+            );
+            let patchset = patchset.clone();
+            async move { worker.run(patchset, None).await }
+        };
+        let cached = |calls: &std::sync::Arc<AtomicUsize>, stop_at_verification, replay| {
+            let inner = std::sync::Arc::new(MockInterruptibleProvider {
+                calls: calls.clone(),
+                stop_at_verification,
+            });
+            async move {
+                let cached = crate::ai::cache::CachingAiProvider::new(inner, cache_path, 30)
+                    .await
+                    .unwrap();
+                let cached = if replay { cached } else { cached.record_only() };
+                std::sync::Arc::new(cached) as std::sync::Arc<dyn crate::ai::AiProvider>
+            }
+        };
+
+        // The same review uninterrupted, with nothing recorded.
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let whole = review(std::sync::Arc::new(MockInterruptibleProvider {
+            calls: calls.clone(),
+            stop_at_verification: false,
+        }))
+        .await
+        .unwrap()
+        .output
+        .unwrap();
+        let whole_calls = calls.load(Ordering::SeqCst);
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        assert!(
+            review(cached(&calls, true, false).await).await.is_err(),
+            "verification fails, and the review with it"
+        );
+        let answered = calls.load(Ordering::SeqCst);
+        assert!(answered > 0 && answered < whole_calls);
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let resumed = review(cached(&calls, false, true).await)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            whole_calls - answered,
+            "the resumed review asks only what the interrupted one did not get answered"
+        );
+        assert_eq!(resumed, whole);
+    }
 }

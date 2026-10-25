@@ -148,6 +148,10 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
 
+        /// Continue an interrupted review: replay the answers it recorded
+        #[arg(long)]
+        resume: bool,
+
         /// Verify and report pre-existing bugs in the touched code
         #[arg(long)]
         report_preexisting: bool,
@@ -366,6 +370,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
     match &cli.command {
         Some(Commands::Review {
             no_ai,
+            resume,
             ai_provider,
             model,
             effort,
@@ -373,6 +378,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             ..
         }) => Overrides {
             no_ai: *no_ai,
+            resume: *resume,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -2765,6 +2771,11 @@ async fn handle_review_command(
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
                 eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
+                if partial && cfg!(feature = "cache") {
+                    eprintln!(
+                        "Run it again with --resume to continue from the answers it recorded"
+                    );
+                }
             }
         }
     };
@@ -5300,6 +5311,7 @@ mod tests {
             "--baseline",
             "main",
             "--no-ai",
+            "--resume",
             "--report-preexisting",
             "--format",
             "json",
@@ -5314,6 +5326,7 @@ mod tests {
                 baseline,
                 settings,
                 no_ai,
+                resume,
                 report_preexisting,
                 format,
                 agent,
@@ -5324,6 +5337,7 @@ mod tests {
                 assert_eq!(baseline.as_deref(), Some("main"));
                 assert!(settings.is_none());
                 assert!(no_ai);
+                assert!(resume);
                 assert!(report_preexisting);
                 assert!(matches!(format, OutputFormat::Json));
                 assert!(agent);
