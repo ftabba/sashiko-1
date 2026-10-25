@@ -51,7 +51,7 @@ sashiko review HEAD~3..HEAD
 sashiko review --report-preexisting
 ```
 
-Local review uses a temporary scratch clone for patch application, leaving your working tree and git metadata untouched.
+Local review reads each commit in the range from git, without a scratch clone or patch application, and leaves your working tree untouched.
 
 > [!IMPORTANT]
 > **Data Privacy & API Costs:** Sashiko sends patch data and relevant surrounding files/history from your repository to your configured LLM provider. Ensure you are authorized to share this code with your chosen provider and monitor your token usage and billing, as multi-stage reviews can incur significant API costs. The Sashiko authors assume no liability for data transmission or API charges.
