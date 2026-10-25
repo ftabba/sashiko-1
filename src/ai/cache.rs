@@ -1,12 +1,18 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use regex::Regex;
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use super::{AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities, get_log_prefix};
+
+/// A date as the workflows' system prompts state it ("%A, %B %d, %Y").
+static PROMPT_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b(?:Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day, [A-Z][a-z]+ \d{2}, \d{4}\b").unwrap()
+});
 
 pub struct CachingAiProvider {
     inner: Arc<dyn AiProvider>,
@@ -90,6 +96,13 @@ impl CachingAiProvider {
         // Strip nondeterministic fields
         if let serde_json::Value::Object(ref mut map) = val {
             map.remove("context_tag");
+            // The system prompt's date would make every day's keys differ. Only
+            // the first date is today's: a later one is part of the patch.
+            if let Some(system) = map.get_mut("system")
+                && let Some(text) = system.as_str()
+            {
+                *system = PROMPT_DATE.replace(text, "<date>").into();
+            }
         }
         super::scrub_thought_signatures(&mut val);
         let canonical = serde_json::to_string(&val).unwrap_or_default();
@@ -599,6 +612,54 @@ mod tests {
             per_attempt[1] > 0,
             "the retry never reached the model: calls per attempt {:?}",
             per_attempt
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_prompt_date_does_not_reach_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response_cache.db");
+        let provider = CachingAiProvider::new(
+            Arc::new(RejectedAnswers {
+                calls: Arc::new(AtomicU64::new(0)),
+            }),
+            path.to_str().unwrap(),
+            30,
+        )
+        .await
+        .unwrap();
+        let key = |system: String| {
+            provider.compute_cache_key(&AiRequest {
+                system: Some(system),
+                ..Default::default()
+            })
+        };
+
+        // A week of dates, as the workflows format them.
+        let keys: std::collections::HashSet<String> = (0..7)
+            .map(|day| {
+                let date =
+                    chrono::NaiveDate::from_ymd_opt(2026, 10, 25).unwrap() + chrono::Days::new(day);
+                key(format!(
+                    "the current date is {}. Review this.",
+                    date.format("%A, %B %d, %Y")
+                ))
+            })
+            .collect();
+        assert_eq!(keys.len(), 1);
+        assert!(!keys.contains(&key(
+            "the current date is Sunday, October 25, 2026. Review that.".to_string()
+        )));
+
+        // A date in the patch below it still counts.
+        let patch = |date: &str| {
+            key(format!(
+                "the current date is Sunday, October 25, 2026.\n+ * {date}: fixed"
+            ))
+        };
+        assert_ne!(
+            patch("Monday, October 26, 2026"),
+            patch("Tuesday, October 27, 2026")
         );
     }
 }
