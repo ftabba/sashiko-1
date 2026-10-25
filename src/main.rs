@@ -2477,7 +2477,7 @@ async fn handle_review_command(
     {
         eprint_colored(display.color, Color::Yellow, "WARNING:")?;
         eprintln!(
-            " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
+            " Working directory is dirty. The review reads commits only, so uncommitted changes are not reviewed."
         );
         if !agent && std::io::stdin().is_terminal() {
             eprint!("Do you want to proceed? [y/N]: ");
